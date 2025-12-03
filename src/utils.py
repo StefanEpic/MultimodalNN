@@ -8,24 +8,27 @@ from src.dataset import collate_fn
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 
-def validate(model, loader, device, mean, std):
+def validate(model, loader, device, mask_text=False, mask_image=False):
     model.eval()
     mae_sum = 0
     count = 0
+    mean = loader.dataset.mean
+    std = loader.dataset.std
     with torch.no_grad():
         for batch in loader:
-            inputs = {
-                "input_ids": batch["input_ids"].to(device),
-                "attention_mask": batch["attention_mask"].to(device),
-                "image": batch["image"].to(device)
-            }
+            preds = model(
+                input_ids=batch["input_ids"].to(device),
+                attention_mask=batch["attention_mask"].to(device),
+                image=batch["image"].to(device),
+                mask_text=mask_text,
+                mask_image=mask_image
+            )
+            # переносим всё на device
             labels = batch["label"].to(device)
-            preds = model(**inputs)
-            # ОБРАТНАЯ ТРАНСФОРМАЦИЯ
-            preds_real = preds * std + mean
-            labels_real = labels * std + mean
-
-            mae_sum += torch.sum(torch.abs(preds_real - labels_real)).item()
+            # денормализация
+            preds = preds * std + mean
+            labels = labels * std + mean
+            mae_sum += torch.sum(torch.abs(preds - labels)).item()
             count += labels.size(0)
     return mae_sum / count
 
@@ -59,7 +62,7 @@ def train(config, train_ds, val_ds):
         num_warmup_steps=200,
         num_training_steps=len(train_loader) * config.EPOCHS
     )
-    criterion = nn.L1Loss()
+    criterion = nn.MSELoss()
     best_mae = 1e9
     for epoch in range(config.EPOCHS):
         model.train()
@@ -78,12 +81,10 @@ def train(config, train_ds, val_ds):
             optimizer.step()
             total_loss += loss.item()
         scheduler.step()
-        # Передаём mean/std
-        val_mae = validate(
-            model, val_loader, device,
-            config.CAL_MEAN, config.CAL_STD
-        )
-        print(f"Эпоха {epoch+1}/{config.EPOCHS}. Train Loss: {total_loss/len(train_loader):.2f}. MAE: {val_mae:.2f}")
+        val_mae = validate(model, val_loader, device, mask_text=False, mask_image=False)
+        mae_no_text = validate(model, val_loader, device, mask_text=True, mask_image=False)
+        mae_no_image = validate(model, val_loader, device, mask_text=False, mask_image=True)
+        print(f"Эпоха {epoch+1}/{config.EPOCHS}. Train Loss: {total_loss/len(train_loader):.2f}. Общее MAE: {val_mae:.2f}. MAE для изображений: {mae_no_text:.2f}. MAE для текста: {mae_no_image:.2f}")
         if val_mae < best_mae:
             best_mae = val_mae
             torch.save(model.state_dict(), config.SAVE_PATH)

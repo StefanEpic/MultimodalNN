@@ -16,17 +16,20 @@ class MultimodalDataset(Dataset):
         self.config = config
         self.tokenizer = AutoTokenizer.from_pretrained(config.TEXT_MODEL_NAME)
         self.transforms = get_transforms(config, ds_type)
+        # Сливаем csv
         self._fix_names()
+        # Нормализация таргета
+        self.mean = dishes_df["total_calories"].mean()
+        self.std = dishes_df["total_calories"].std()
+
 
     def _fix_names(self):
-        ingr_map = dict(zip(self.ingredients["id"], self.ingredients["ingr"]))
-
+        id_to_name = dict(zip(self.ingredients["id"], self.ingredients["ingr"]))
         def map_ingrs(s):
             if pd.isna(s):
-                return ""
+                return []
             ids = s.split(";")
-            return ", ".join([ingr_map.get(i, i) for i in ids])
-
+            return [id_to_name.get(i, i) for i in ids]
         self.dishes["ingredients"] = self.dishes["ingredients"].apply(map_ingrs)
 
     def __len__(self):
@@ -34,8 +37,8 @@ class MultimodalDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.dishes.iloc[idx]
-        ingredients = "\n".join([f'- {i}' for i in row['ingredients']])
-        text = f"List of ingredients: \n{ingredients}\n\nTotal mass: {row['total_mass']} grams."
+        ingredients = ", ".join([i for i in row['ingredients']])
+        text = f"List of ingredients: {ingredients}\nTotal mass: {row['total_mass']} grams."
         image_path = f"data/images/{row['dish_id']}/rgb.png"
         try:
             img = Image.open(image_path).convert("RGB")
@@ -44,13 +47,11 @@ class MultimodalDataset(Dataset):
         img_np = np.array(img)
         aug = self.transforms(image=img_np)
         img_tensor = aug["image"]
+        label_norm = (row["total_calories"] - self.mean) / self.std
         return {
             "text": text,
             "image": img_tensor,
-            "label": torch.tensor(
-                (row["total_calories"] - self.config.CAL_MEAN) / self.config.CAL_STD,
-                dtype=torch.float32
-            )
+            "label": torch.tensor(label_norm, dtype=torch.float32)
         }
 
 
@@ -62,9 +63,10 @@ def get_transforms(config, ds_type="train"):
             # A.RandomCrop(height=cfg.input_size[1], width=cfg.input_size[2]),
             # Заменяем на центральную вырезку, блюда в центре
             A.CenterCrop(height=cfg.input_size[1], width=cfg.input_size[2]),
-            A.HorizontalFlip(p=0.5),
+            A.HorizontalFlip(p=0.3),
+            A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=15, p=0.7),
             # Добавляем цвета
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.6),
+            A.ColorJitter(brightness=0.1, contrast=0.2, saturation=0.1, hue=0.1, p=0.6),
             A.RandomBrightnessContrast(p=0.2),
             A.HueSaturationValue(p=0.2),
             # Нормализуем
