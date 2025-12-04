@@ -13,54 +13,67 @@ def freeze_all(model):
     for param in model.parameters():
         param.requires_grad = False
 
-
 def unfreeze_last_n_layers(model, n):
-    encoder_layers = model.encoder.layer  # <-- правильный путь
-    total = len(encoder_layers)
-    for layer in encoder_layers[total - n:]:
+    layers = None
+    if hasattr(model, "encoder") and hasattr(model.encoder, "layer"):
+        layers = model.encoder.layer
+    else:
+        base = getattr(model, "base_model", None)
+        if base is not None and hasattr(base, "encoder") and hasattr(base.encoder, "layer"):
+            layers = base.encoder.layer
+
+    if layers is None:
+        return
+
+    total = len(layers)
+    for layer in layers[max(0, total - n):]:
         for param in layer.parameters():
             param.requires_grad = True
-
 
 class MultimodalModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.text_model = AutoModel.from_pretrained(config.TEXT_MODEL_NAME)
         self.image_model = timm.create_model(config.IMAGE_MODEL_NAME, pretrained=True, num_classes=0)
-
         self.text_proj = nn.Sequential(
             nn.Linear(self.text_model.config.hidden_size, config.HIDDEN_DIM),
             nn.ReLU(),
-            nn.BatchNorm1d(config.HIDDEN_DIM),
+            nn.LayerNorm(config.HIDDEN_DIM),
+            nn.Dropout(config.DROPOUT)
         )
-
         self.image_proj = nn.Sequential(
             nn.Linear(self.image_model.num_features, config.HIDDEN_DIM),
             nn.ReLU(),
-            nn.BatchNorm1d(config.HIDDEN_DIM),
+            nn.LayerNorm(config.HIDDEN_DIM),
+            nn.Dropout(config.DROPOUT)
         )
-
+        fused_dim = config.HIDDEN_DIM * 3 + 1
         self.regressor = nn.Sequential(
-            nn.Linear(config.HIDDEN_DIM * 3, config.HIDDEN_DIM),
+            nn.Linear(fused_dim, config.HIDDEN_DIM),
             nn.ReLU(),
+            nn.LayerNorm(config.HIDDEN_DIM),
             nn.Dropout(config.DROPOUT),
-            nn.Linear(config.HIDDEN_DIM, 1)
+            nn.Linear(config.HIDDEN_DIM, config.HIDDEN_DIM // 2),
+            nn.ReLU(),
+            nn.Linear(config.HIDDEN_DIM // 2, 1)
         )
 
         # === PARTIAL FREEZE TEXT =============================
         freeze_all(self.text_model)
-        unfreeze_last_n_layers(self.text_model, n=8)
+        unfreeze_last_n_layers(self.text_model, n=6)
 
         # === PARTIAL FREEZE IMAGE ===========================
         freeze_all(self.image_model)
         if hasattr(self.image_model, "blocks"):
-            for block in self.image_model.blocks[-2:]:
+            for block in getattr(self.image_model, "blocks")[-5:]:
                 for param in block.parameters():
                     param.requires_grad = True
+        else:
+            for param in self.image_model.parameters():
+                param.requires_grad = True
 
-    def forward(self, input_ids, attention_mask, image,
+    def forward(self, input_ids, attention_mask, image, mass=None,
                 mask_text=False, mask_image=False):
-
         # TEXT
         if not mask_text:
             t = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
@@ -76,5 +89,11 @@ class MultimodalModel(nn.Module):
         else:
             i_emb = torch.zeros((image.size(0), self.image_proj[0].out_features), device=image.device)
 
-        fused = torch.cat([t_emb, i_emb, t_emb * i_emb], dim=1)
+        interaction = t_emb * i_emb
+        if mass is None:
+            mass = torch.zeros((image.size(0), 1), device=image.device)
+        else:
+            mass = mass.view(-1, 1)
+
+        fused = torch.cat([t_emb, i_emb, interaction, mass], dim=1)
         return self.regressor(fused).squeeze(1)
